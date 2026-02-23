@@ -3,5 +3,6 @@ sentence_transformers
 scikit-learn
 pymongo
 tqdm
-google-genai
 python-dotenv
+openai
+pandas

@@ -7,8 +7,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from datetime import datetime
 
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
+from openai import OpenAI
 from tqdm import tqdm
 
 
@@ -19,18 +18,21 @@ INPUT_FILE = "result.v2.jsonl"
 OUTPUT_FILE = "qa_dataset.csv"
 
 # Maximum number of answers per question to include in the dataset
-MAX_RESPONSES_PER_QUESTION = 30
+MAX_RESPONSES_PER_QUESTION = 40
 
 # Score ratio threshold for considering an answer "correct"
 # ratio = score / base_score
-CORRECTNESS_THRESHOLD = 0.7
+CORRECTNESS_THRESHOLD = 0.6
+MIN_INCORRECT_FRACTION = 0.1  # at least 10% incorrect per question (if available)
+MAX_INCORRECT_FRACTION = 0.3  # at most 30% incorrect per question
 
 # Maximum number of questions to process
-MAX_QUESTIONS = 50
+MAX_QUESTIONS = 250
 
-# Google GenAI configuration
-MODEL_NAME = "gemma-3-27b-it"
-API_KEY_ENV_VAR = "GAS_API_KEY"
+# Local llama.cpp (OpenAI-compatible) configuration
+LLAMA_BASE_URL = "http://127.0.0.1:5836/v1"
+# Logical model name as exposed by llama-server (adjust if needed, e.g. alias)
+LLAMA_MODEL_NAME = "gemma-3-12b-it-q4"
 
 # Logging configuration
 LOG_DIR = "logs"
@@ -68,6 +70,7 @@ logger.addHandler(console_handler)
 
 # ======================== Core helpers ========================
 
+
 def iter_questions(filepath: str) -> Iterable[Dict[str, Any]]:
     """
     Stream the JSONL file line by line; each line is one question object.
@@ -84,7 +87,9 @@ def iter_questions(filepath: str) -> Iterable[Dict[str, Any]]:
             try:
                 yield json.loads(line)
             except json.JSONDecodeError as e:
-                logger.warning("JSON decode error: %s | line preview: %s", e, line[:200])
+                logger.warning(
+                    "JSON decode error: %s | line preview: %s", e, line[:200]
+                )
                 continue
 
 
@@ -148,24 +153,76 @@ def select_responses_for_question(
     if not prepared:
         return question_text, info, []
 
-    # Sort by ratio descending so we always pick the highest-quality answers first
     prepared.sort(key=lambda x: x["ratio"], reverse=True)
-    # Limit the number of responses considered for this question
-    prepared = prepared[:MAX_RESPONSES_PER_QUESTION]
 
     return question_text, info, prepared
 
 
-# ======================== Google GenAI (reference answer) ========================
+def select_responses_with_distribution(
+    responses: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Select responses for the final dataset such that, as much as possible,
+    between MIN_INCORRECT_FRACTION and MAX_INCORRECT_FRACTION of them are incorrect.
+
+    If there are not enough incorrect responses, we include all incorrect ones
+    and fill the rest with correct responses.
+    """
+    if not responses:
+        return []
+
+    total_available = len(responses)
+    # در نهایت حداکثر این تعداد پاسخ برای هر سوال وارد دیتاست می‌شود.
+    limit = min(total_available, MAX_RESPONSES_PER_QUESTION)
+
+    incorrect = [r for r in responses if not r.get("is_correct")]
+    correct = [r for r in responses if r.get("is_correct")]
+
+    # اگر کلاً پاسخ غلط نداریم، فقط به محدودیت تعداد احترام می‌گذاریم.
+    if not incorrect:
+        return responses[:limit]
+
+    # Bounds based on the *final* number of rows we're going to keep (limit)
+    min_incorrect = int(limit * MIN_INCORRECT_FRACTION)
+    max_incorrect = int(limit * MAX_INCORRECT_FRACTION)
+
+    # برای سوال‌های کم‌نمونه حداقل ۱ پاسخ غلط (اگر وجود داشته باشد)
+    if min_incorrect == 0 and limit > 0:
+        min_incorrect = 1
+    if max_incorrect < min_incorrect:
+        max_incorrect = min_incorrect
+
+    available_incorrect = len(incorrect)
+
+    # حداکثر تعداد پاسخ غلطی که می‌توانیم انتخاب کنیم
+    target_incorrect = min(available_incorrect, max_incorrect, limit)
+
+    # اگر حتی با استفاده از همه‌ی پاسخ‌های غلط، به min نمی‌رسیم،
+    # همان همه‌ی غلط‌ها را می‌گیریم (کمتر از حداقل، ولی چاره‌ای نیست).
+    if target_incorrect < min_incorrect:
+        chosen_incorrect = incorrect[:target_incorrect]
+    else:
+        chosen_incorrect = incorrect[:target_incorrect]
+
+    remaining_slots = max(0, limit - len(chosen_incorrect))
+    chosen_correct = correct[:remaining_slots]
+
+    selected = chosen_correct + chosen_incorrect
+    return selected
+
+
+# ======================== Local LLaMA (reference answer) ========================
+
 
 def build_reference_answer(
-    client: genai.Client,
+    client: OpenAI,
     question_text: str,
     info: Optional[Dict[str, Any]],
     correct_answers: List[str],
 ) -> Optional[str]:
     """
-    Use Google GenAI (Gemma 3 27B) to synthesize a single reference/ideal answer
+    Use local Gemma 3 12B (via llama.cpp OpenAI-compatible API) to synthesize
+    a single reference/ideal answer
     based on the question text, metadata (info), and high-scoring student answers.
 
     Returns the reference answer string, or None on failure.
@@ -218,41 +275,91 @@ High-scoring student answers (Persian):
     # Try up to 2 times if we hit an exception from the model.
     for attempt in range(2):
         try:
-            response = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema={
-                        "type": "OBJECT",
-                        "properties": {
-                            "reference_answer": {"type": "STRING"},
-                        },
-                        "required": ["reference_answer"],
+            response = client.chat.completions.create(
+                model=LLAMA_MODEL_NAME,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are an expert exam grader. "
+                            "You write concise, high-quality Persian reference answers "
+                            "based on exam questions and high-scoring student answers. "
+                            "ALWAYS respond with a single JSON object and nothing else."
+                        ),
                     },
-                ),
+                    {
+                        "role": "user",
+                        "content": prompt
+                        + "\n\nIMPORTANT: Respond ONLY with a valid JSON object that matches the schema above. "
+                        + "Do not include any extra text, explanations, or markdown.",
+                    },
+                ],
+                temperature=0.2,
+                max_tokens=512,
             )
 
-            # With structured output, response.parsed should already contain a dict-like object.
-            parsed = None
-            if hasattr(response, "parsed") and response.parsed is not None:
-                parsed = response.parsed  # type: ignore[assignment]
+            if not response.choices:
+                logger.warning("Empty choices from local model for reference answer.")
+                return None
+
+            message = response.choices[0].message
+            content = getattr(message, "content", None)
+
+            # Handle both string and list-of-blocks content formats
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                # Newer OpenAI client style: list of content blocks
+                parts: List[str] = []
+                for block in content:
+                    # block may be dict-like or object with .text
+                    if isinstance(block, dict):
+                        maybe_text = block.get("text")
+                        if isinstance(maybe_text, str):
+                            parts.append(maybe_text)
+                    else:
+                        maybe_text = getattr(block, "text", None)
+                        if isinstance(maybe_text, str):
+                            parts.append(maybe_text)
+                text = "".join(parts)
             else:
-                text = getattr(response, "text", None)
-                if not text:
-                    logger.warning("Empty response from model for reference answer.")
-                    return None
-                parsed = json.loads(text)
+                text = ""
+
+            if not text:
+                logger.warning("Empty content from local model for reference answer.")
+                return None
+
+            # Some local models wrap JSON in markdown fences like ```json ... ```.
+            cleaned = text.strip()
+            if cleaned.startswith("```"):
+                # Remove leading ``` or ```json and trailing ```
+                cleaned = cleaned.lstrip("`")
+                # After lstrip, it might start with 'json' or a newline
+                if cleaned.lower().startswith("json"):
+                    cleaned = cleaned[4:]
+                cleaned = cleaned.strip()
+                if cleaned.endswith("```"):
+                    cleaned = cleaned[:-3].strip()
+
+            try:
+                parsed = json.loads(cleaned)
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Failed to parse JSON from local model response. Raw text: %s",
+                    text[:500],
+                )
+                return None
 
             # Extract the reference_answer field from the parsed object.
             if isinstance(parsed, dict):
                 ref = parsed.get("reference_answer")
             else:
-                # For Pydantic models or other objects, fall back to attribute access.
-                ref = getattr(parsed, "reference_answer", None)
+                ref = None
 
             if not isinstance(ref, str):
-                logger.warning("Model response missing 'reference_answer' string field.")
+                logger.warning(
+                    "Model response missing 'reference_answer' string field."
+                )
                 return None
             ref = ref.strip()
             if not ref:
@@ -260,22 +367,27 @@ High-scoring student answers (Persian):
             return ref
         except Exception as e:
             logger.exception(
-                "Error generating reference answer (attempt %s/2): %s", attempt + 1, e
+                "Error generating reference answer from local model (attempt %s/2): %s",
+                attempt + 1,
+                e,
             )
             if attempt == 1:
                 return None
 
 
-def create_client() -> genai.Client:
-    api_key = os.environ.get(API_KEY_ENV_VAR)
-    if not api_key:
-        raise RuntimeError(
-            f"API key environment variable '{API_KEY_ENV_VAR}' is not set."
-        )
-    return genai.Client(api_key=api_key)
+def create_client() -> OpenAI:
+    """
+    Create an OpenAI-compatible client that talks to the local llama.cpp server.
+
+    The API key is not actually checked by llama.cpp, but the OpenAI client
+    requires a non-empty string, so we provide a dummy default.
+    """
+    api_key = os.environ.get("LLAMA_API_KEY", "sk-local-not-required")
+    return OpenAI(base_url=LLAMA_BASE_URL, api_key=api_key)
 
 
 # ======================== Main pipeline ========================
+
 
 def build_dataset(
     input_path: str = INPUT_FILE,
@@ -350,7 +462,9 @@ def build_dataset(
                     continue
 
                 # Only use responses that pass the correctness threshold to build the reference answer
-                correct_answers = [r["value"] for r in responses if r["is_correct"]]
+                correct_answers = [r["value"] for r in responses if r["is_correct"]][
+                    :20
+                ]
                 if not correct_answers:
                     skipped_no_correct_for_ref += 1
                     logger.info(
@@ -377,7 +491,10 @@ def build_dataset(
 
                 processed_questions += 1
 
-                for r in responses:
+                # Enforce desired distribution of incorrect/correct answers in the dataset rows.
+                selected_responses = select_responses_with_distribution(responses)
+
+                for r in selected_responses:
                     writer.writerow(
                         [
                             question_text,
@@ -417,4 +534,3 @@ def build_dataset(
 if __name__ == "__main__":
     # Simple CLI entry-point (no argument parsing; adjust variables at top).
     build_dataset()
-

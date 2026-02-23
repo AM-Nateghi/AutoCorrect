@@ -1,33 +1,148 @@
+from sklearn.feature_extraction.text import TfidfVectorizer
+from typing import Tuple, List
 from sentence_transformers import SentenceTransformer, util
+import re
 import hazm
+import pandas as pd
 
+qa_df = pd.read_csv("./qa_dataset.csv")
 model = SentenceTransformer("PartAI/Tooka-SBERT-V2-Large")
 
 normalizer = hazm.Normalizer()
+tokenizer = hazm.WordTokenizer()
+stemmer = hazm.Stemmer()
+lemmatizer = hazm.Lemmatizer()
+stopwords = hazm.stopwords_list()
+
+additional_word = [
+    "سلام",
+    "درود",
+    "پیروز",
+    "دوستدار",
+    "امیدوارم",
+    "پرسش",
+    "بنام",
+    "یاعلی",
+    "یا علی",
+    "خداحافظ",
+    "موفق",
+]
+
+# Expanded irrelevant stems/lemmas
+irrelevant_stems = set(
+    [
+        stemmer.stem(w)
+        for w in [
+            "سلام",
+            "درود",
+            "پیروز",
+            "دوستدار",
+            "امیدوارم",
+            "پرسش",
+            "بنام",
+            "یاعلی",
+            "یا علی",
+            "خداحافظ",
+            "موفق",
+        ]
+    ]
+    + [
+        lemmatizer.lemmatize(w)
+        for w in [
+            "سلام",
+            "درود",
+            "پیروز",
+            "دوستدار",
+            "امیدوارم",
+            "پرسش",
+            "خدمت",
+            "خدا",
+            "بنام",
+            "یاعلی",
+            "یا علی",
+            "خداحافظ",
+            "موفق",
+            "باشید",
+            "🌹",
+            "✨",
+        ]
+    ]
+)
 
 
-def normalize_text(text):
-    return normalizer.normalize(text)
+def filter_irrelevant(sentences: List[str]) -> List[str]:
+    filtered = []
+    for s in sentences:
+        norm_s = normalizer.normalize(s)
+        tokens = tokenizer.tokenize(norm_s)
+        stems = [stemmer.stem(t) for t in tokens]
+        lems = [lemmatizer.lemmatize(t) for t in tokens]
+        stem_str = " ".join(stems)
+        if any(st in irrelevant_stems for st in stems + lems):
+            # Check position with regex on stemmed string
+            if re.search(
+                r"^(\W*(" + "|".join(irrelevant_stems) + r")\W*)",
+                stem_str,
+                re.IGNORECASE,
+            ) or re.search(
+                r"(\W*(" + "|".join(irrelevant_stems) + r")\W*)$",
+                stem_str,
+                re.IGNORECASE,
+            ):
+                continue
+        filtered.append(s)
+    return filtered
 
 
-# مثال استفاده
-answer_correct = "اون فرد خودش رو با بازیگر مورد علاقه اش متحد فرض کرده برای همین از موفقیت اونو موفقیت خودش میبینه."
-answer_student = "به نام یکتا دادار دادگر سلام و درود سخن دوست گرامی متین است اما در دسته‌بندی لذت‌ها ما لذتی را داریم که در آن فرد مورد نظر خود را با دیگری یا یک تیم، یکی می‌داند و پس از این وهم یا هرچه که آنرا بنامیم؛ پیروزی فرد مقابل را پیروزی خود حساب می‌کند … فکر کنم دیگه باید به پاسخ رسیده باشید ولی بیشتر توضیح می‌دهم و یک مثال مانند مثال شما می‌زنم: سخن شما هم دقیقا یکی از انواع به دنبال لذت بودن هست که فرد با درنظر گرفتن یکی بودن خود و بازیگر مورد علاقه‌اش، پیروزی او را در واقع موفقیت خودش حساب می‌کنه و اینگونه به دنبال لذت می‌رود … نمونه دیگر: زمان بازی تیم پرسپولیس فرا رسیده و میلیون‌ها تن انسان پشت تلویزیون‌ها نشسته‌اند و با دقت و هیجان بازی را می‌بینند هر گلی که پرسپولیس می‌زند آنها خوشحال می‌شوند و شادی می‌کنند و هر گلی که می‌خورد ناراحت می‌شوند؛ این هم نمونه‌ی دیگری از درنظر گرفتن خود با دیگران و به دنبال لذت رفتن … امیدوارم پاسخم شما را قانع کرده باشه؛ اگر پرسش دیگری نیز داشتید در خدمتم. پیروز باشید🌹دوستدار شما امیرحسین صفری."
+def extract_keywords(text: str, top_n=10) -> set:
+    norm_text = normalizer.normalize(text)
+    tokens = [
+        stemmer.stem(t) for t in tokenizer.tokenize(norm_text) if t not in stopwords
+    ]
+    if not tokens:
+        return set()
+    vectorizer = TfidfVectorizer()
+    vectorizer.fit_transform([" ".join(tokens)])
+    feature_names = vectorizer.get_feature_names_out()
+    sorted_items = sorted(zip(vectorizer.idf_, feature_names), reverse=True)[:top_n]
+    return set(word for _, word in sorted_items)
 
-# نرمال‌سازی
-correct_norm = normalize_text(answer_correct)
-student_norm = normalize_text(answer_student)
 
-# embedding
-emb_correct = model.encode(correct_norm)
-emb_student = model.encode(student_norm)
+def check(true_sentence: str, student_sentence: str) -> Tuple[bool, float, float]:
+    true_norm = normalizer.normalize(true_sentence)
+    stud_norm = normalizer.normalize(student_sentence)
 
-# cosine similarity
-similarity = util.cos_sim(emb_correct, emb_student).item()
+    true_sents = filter_irrelevant(hazm.sent_tokenize(true_norm))
+    stud_sents = filter_irrelevant(hazm.sent_tokenize(stud_norm))
+    true_filtered = " ".join(true_sents)
+    stud_filtered = " ".join(stud_sents)
 
-print(f"similirity: {similarity:.4f}")
+    emb_true = model.encode(true_filtered) if true_filtered else model.encode(true_norm)
+    emb_stud = model.encode(stud_filtered) if stud_filtered else model.encode(stud_norm)
+    cos_sim = util.cos_sim(emb_true, emb_stud).item()
 
-# طبقه‌بندی ساده (threshold مثلاً 0.82)
-threshold = 0.75
-is_correct = similarity >= threshold
-print("is true" if is_correct else "is false")
+    true_keywords = extract_keywords(true_filtered or true_norm)
+    stud_keywords = extract_keywords(stud_filtered or stud_norm)
+    if not true_keywords:
+        keyword_overlap = 0.0
+    else:
+        keyword_overlap = len(true_keywords.intersection(stud_keywords)) / len(
+            true_keywords
+        )
+
+    combined = 0.6 * cos_sim + 0.4 * keyword_overlap
+    return (combined >= 0.65, combined, keyword_overlap)
+
+
+# Check the success model ratio
+success_count = 0
+_cototal = 0
+
+for qt, ta, sa, ic, cr in qa_df.values:
+    is_correct, _, _ = check(ta, sa)
+    if is_correct == ic:
+        success_count += 1
+    _cototal += 1
+    break
+
+print(success_count)
