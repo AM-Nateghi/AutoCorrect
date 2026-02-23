@@ -9,7 +9,8 @@ from datetime import datetime
 # ======================== Settings ========================
 batch_size = 100
 OUTPUT_FILE = "results.jsonl"
-LOG_FILE = "log.txt"
+LOG_DIR = "logs"
+LOG_FILE = os.path.join(LOG_DIR, "get_data.py.log")
 
 # ======================== Database Connection ========================
 print("🔗 Connecting to database...")
@@ -87,9 +88,11 @@ if os.path.exists(OUTPUT_FILE) and os.path.getsize(OUTPUT_FILE) > 0:
 else:
     print("📝 Starting fresh - no checkpoint file found\n")
 
-# Create file for appending (if it doesn't exist)
+# Create folders/files for appending (if they don't exist)
 if not os.path.exists(OUTPUT_FILE):
     Path(OUTPUT_FILE).touch()
+
+Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
 
 # ======================== Statistics Variables ========================
 results = []

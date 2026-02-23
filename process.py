@@ -25,7 +25,8 @@ from tqdm import tqdm
 # ======================== Settings ========================
 INPUT_FILE = "results.jsonl"
 OUTPUT_FILE = "result.v2.jsonl"
-LOG_FILE = "process.py.log"
+LOG_DIR = "logs"
+LOG_FILE = os.path.join(LOG_DIR, "process.py.log")
 
 MIN_ANSWER_LEN = 10
 MAX_ANSWER_LEN = 5000
@@ -34,7 +35,7 @@ MAX_RESPONSES_PER_QUESTION = 250
 MIN_ACHIVED_SCORE_RATION = 0.2
 
 # موازی: تعداد نخ برای پردازش همزمان پاسخ‌ها
-N_WORKERS = 16
+N_WORKERS = 8
 # حداکثر زمان برای پردازش یک پاسخ (ثانیه)
 RESPONSE_PROCESS_TIMEOUT = 10
 
@@ -44,6 +45,8 @@ BUFFER_SIZE = 64 * 1024  # 64 KB برای خواندن/نوشتن
 # هم به فایل هم به کنسول
 log_format = "%(asctime)s | %(levelname)-7s | %(message)s"
 date_fmt = "%Y-%m-%d %H:%M:%S"
+
+Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
 
 file_handler = logging.FileHandler(LOG_FILE, mode="w", encoding="utf-8")
 file_handler.setLevel(logging.DEBUG)
@@ -55,6 +58,7 @@ console_handler.setFormatter(logging.Formatter(log_format, date_fmt))
 
 logger = logging.getLogger("process")
 logger.setLevel(logging.DEBUG)
+logger.handlers.clear()
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
@@ -186,7 +190,11 @@ def process_one(question_obj: dict, executor: ThreadPoolExecutor) -> dict | None
     def _base_score_ok(resp: dict) -> bool:
         bs = resp.get("base_score")
         sc = resp.get("score")
-        if bs is None or sc is None:
+        if not bs or not sc:
+            return False
+        bs = float(bs)
+        sc = float(sc)
+        if bs == 0 or sc == 0:
             return False
         try:
             return float(float(sc) / float(bs)) >= MIN_ACHIVED_SCORE_RATION
