@@ -4,5 +4,10 @@
 *.jsonl
 *.json
 *.csv
+*.zip
+*.rar
 .env
 model/dataset
+model/results
+__pycache__/
+__pycache__/*

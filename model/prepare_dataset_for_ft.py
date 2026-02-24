@@ -4,7 +4,7 @@ import pandas as pd
 from datasets import Dataset
 
 # 1. CSV رو لود کن
-df = pd.read_csv("../qa_dataset_old.csv")  # مسیر فایل CSV خودت
+df = pd.read_csv("../qa_dataset.csv")  # مسیر فایل CSV خودت
 
 
 # 2. ستون text (prompt) بساز – شامل پاسخ هدف YES/NO برای Causal LM
@@ -35,4 +35,4 @@ dataset = dataset.train_test_split(test_size=0.1)  # 90% train, 10% test
 
 print(dataset)
 
-dataset.save_to_disk(".\\dataset")
+dataset.save_to_disk("./dataset")

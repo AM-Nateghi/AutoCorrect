@@ -18,7 +18,7 @@ INPUT_FILE = "result.v2.jsonl"
 OUTPUT_FILE = "qa_dataset.csv"
 
 # Maximum number of answers per question to include in the dataset
-MAX_RESPONSES_PER_QUESTION = 40
+MAX_RESPONSES_PER_QUESTION = 50
 
 # Score ratio threshold for considering an answer "correct"
 # ratio = score / base_score
@@ -27,7 +27,7 @@ MIN_INCORRECT_FRACTION = 0.1  # at least 10% incorrect per question (if availabl
 MAX_INCORRECT_FRACTION = 0.3  # at most 30% incorrect per question
 
 # Maximum number of questions to process
-MAX_QUESTIONS = 250
+MAX_QUESTIONS = 400
 
 # Local llama.cpp (OpenAI-compatible) configuration
 LLAMA_BASE_URL = "http://127.0.0.1:5836/v1"

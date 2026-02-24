@@ -61,12 +61,14 @@ tokenized_dataset = dataset.map(preprocess, batched=True)  # type: ignore[assign
 
 args = TrainingArguments(  # type: ignore[call-arg]
     output_dir="./results",
-    num_train_epochs=1,
+    num_train_epochs=2,
     per_device_train_batch_size=4,  # بسته به GPU
     gradient_accumulation_steps=4,
     learning_rate=2e-4,
     fp16=False,
     bf16=True,
+    eval_strategy="epoch",
+    per_device_eval_batch_size=4,
     save_strategy="steps",
     save_steps=100,
     logging_steps=100,
@@ -77,11 +79,15 @@ trainer = SFTTrainer(
     model=model,
     args=args,
     train_dataset=tokenized_dataset["train"],  # type: ignore[index]
+    eval_dataset=tokenized_dataset["test"],  # type: ignore[index]
     processing_class=tokenizer,
     peft_config=peft_config,
 )
 
 trainer.train()
+
+eval_metrics = trainer.evaluate(tokenized_dataset["test"])  # type: ignore[index]
+print("Evaluation metrics on test set:", eval_metrics)
 
 trainer.save_model("./results/final-model")
 tokenizer.save_pretrained("./results/final-model")
