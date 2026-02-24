@@ -1,9 +1,9 @@
 from transformers import (
-    AutoModelForSequenceClassification,
+    AutoModelForCausalLM,
     AutoTokenizer,
     TrainingArguments,
 )
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig
 from datasets import load_from_disk
 from trl.trainer.sft_trainer import SFTTrainer
 import torch
@@ -25,13 +25,13 @@ tokenizer.pad_token = tokenizer.eos_token
 
 if os.environ.get("HF_TOKEN"):
     huggingface_hub.login(token=os.environ.get("HF_TOKEN"))
+    print("logged in!")
 
-model = AutoModelForSequenceClassification.from_pretrained(
-    model_id, num_labels=2, dtype=torch.bfloat16, device_map="auto"
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
 )
-
-# Quantize / LoRa
-model = prepare_model_for_kbit_training(model)
 
 peft_config = LoraConfig(
     r=16,
@@ -39,21 +39,25 @@ peft_config = LoraConfig(
     target_modules=["q_proj", "v_proj"],
     lora_dropout=0.05,
     bias="none",
-    task_type="SEQ_CLS",
+    task_type="CAUSAL_LM",
 )
-
-model = get_peft_model(model, peft_config)
 
 dataset = load_from_disk(dataset_path="./dataset")
 
 
 def preprocess(examples):
-    return tokenizer(
-        examples["text"], truncation=True, padding="max_length", max_length=512
+    encodings = tokenizer(
+        examples["text"],
+        truncation=True,
+        padding="max_length",
+        max_length=512,
     )
+    # برای مدل causal، برچسب‌ها همان توکن‌های ورودی هستند
+    encodings["labels"] = encodings["input_ids"].copy()
+    return encodings
 
 
-tokenized_dataset = dataset.map(preprocess, batched=True)
+tokenized_dataset = dataset.map(preprocess, batched=True)  # type: ignore[assignment]
 
 args = TrainingArguments(  # type: ignore[call-arg]
     output_dir="./results",
@@ -61,18 +65,19 @@ args = TrainingArguments(  # type: ignore[call-arg]
     per_device_train_batch_size=4,  # بسته به GPU
     gradient_accumulation_steps=4,
     learning_rate=2e-4,
-    fp16=True,  # یا bf16
+    fp16=False,
+    bf16=True,
     save_strategy="steps",
     save_steps=100,
     logging_steps=100,
 )
 
 
-trainer = SFTTrainer(  # type: ignore[call-arg]  # یا Trainer معمولی
+trainer = SFTTrainer(
     model=model,
     args=args,
-    train_dataset=tokenized_dataset,
-    tokenizer=tokenizer,  # type: ignore[call-arg]
+    train_dataset=tokenized_dataset["train"],  # type: ignore[index]
+    processing_class=tokenizer,
     peft_config=peft_config,
 )
 

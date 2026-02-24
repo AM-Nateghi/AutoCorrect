@@ -6,3 +6,8 @@ tqdm
 python-dotenv
 openai
 pandas
+torch
+trl
+peft
+datasets
+accelerate
