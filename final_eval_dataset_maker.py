@@ -1,5 +1,6 @@
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Tuple
 
 from tqdm import tqdm
@@ -18,6 +19,9 @@ from dataset_maker import (
 
 INPUT_FILE = "result.v2.jsonl"
 OUTPUT_FILE = "qa_eval_dataset.jsonl"
+
+# Parallel workers برای پردازش موازی سوال‌ها
+N_WORKERS = 4
 
 # Threshold for turning a score ratio into a binary label.
 LABEL_THRESHOLD = 0.6
@@ -89,14 +93,17 @@ def build_eval_prompt(
 ) -> str:
     """
     Build the evaluation prompt text, following the same structure as
-    training prompts in prepare_dataset_for_ft.py but **بدون** توکن‌های YES/NO.
+    training prompts in prepare_dataset_for_ft.py.
+
+    متن خروجی فقط صورت سؤال + پاسخ مرجع + پاسخ دانش‌آموز + جمله‌ی
+    «Student's answer is correct with True response? YES/NO» است و
+    هیچ برچسب یا خروجی مدل در خود متن وجود ندارد.
     """
     return (
         f"Question: {question_text}\n"
         f"True response: {true_answer}\n"
         f"Student answer: {student_answer}\n"
-        f"Student's answer is correct with True response? YES/NO\n"
-        f"Model: "
+        "Student's answer is correct with True response? YES/NO"
     )
 
 
@@ -134,14 +141,22 @@ def build_final_eval_dataset(
     """
     client = create_client()
     logger.info(
-        "Starting final eval dataset build | input=%s | output=%s",
+        "Starting final eval dataset build | input=%s | output=%s | workers=%d",
         input_path,
         output_path,
+        N_WORKERS,
     )
 
     # Ensure output directory exists (در صورت استفاده از مسیرهای تو در تو)
     out_dir = os.path.dirname(output_path) or "."
     os.makedirs(out_dir, exist_ok=True)
+
+    # همه سوال‌ها را یک‌بار در حافظه می‌خوانیم تا بتوانیم موازی پردازش کنیم
+    try:
+        questions: List[Dict[str, Any]] = list(iter_questions(input_path))
+    except FileNotFoundError:
+        logger.error("Input file not found for final eval dataset: %s", input_path)
+        return 0
 
     total_questions_read = 0
     total_questions_used = 0
@@ -151,98 +166,122 @@ def build_final_eval_dataset(
     skipped_model_failure = 0
     skipped_not_enough_levels = 0
 
-    # برای tqdm، تعداد کل سؤال‌ها را از روی فایل ورودی حساب می‌کنیم
-    try:
-        with open(input_path, "r", encoding="utf-8") as f_in:
-            total_in_file = sum(1 for _ in f_in)
-    except FileNotFoundError:
-        logger.error("Input file not found for final eval dataset: %s", input_path)
-        return 0
+    def _process_one_question(
+        question: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """پردازش یک سوال؛ منطق قبلی، اما مناسب اجرای موازی."""
+        local_stats = {
+            "questions_read": 1,
+            "questions_used": 0,
+            "rows": 0,
+            "skipped_no_valid_responses": 0,
+            "skipped_no_correct_for_ref": 0,
+            "skipped_model_failure": 0,
+            "skipped_not_enough_levels": 0,
+        }
 
-    with open(output_path, "w", encoding="utf-8") as jsonl_file, tqdm(
-        total=total_in_file,
-        desc="📦 Building final eval dataset",
-        unit="question",
-        bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
-    ) as pbar:
-        for question in iter_questions(input_path):
-            total_questions_read += 1
-            q_id = question.get("_id")
+        q_id = question.get("_id")
 
-            question_text, info, responses = select_responses_for_question(question)
-            if not question_text or not responses:
-                skipped_no_valid_responses += 1
-                logger.info(
-                    "Skipping question _id=%s: no valid responses after ratio filter",
-                    q_id,
-                )
-                pbar.update(1)
-                continue
-
-            # Use "correct" responses (طبق threshold دیتاست اصلی) to build reference answer.
-            correct_answers = [r["value"] for r in responses if r.get("is_correct")]
-            if not correct_answers:
-                skipped_no_correct_for_ref += 1
-                logger.info(
-                    "Skipping question _id=%s: no responses above correctness threshold (%.2f)",
-                    q_id,
-                    CORRECTNESS_THRESHOLD,
-                )
-                pbar.update(1)
-                continue
-
-            true_answer = build_reference_answer(
-                client=client,
-                question_text=question_text,
-                info=info,
-                correct_answers=correct_answers[:20],
-            )
-            if not true_answer:
-                skipped_model_failure += 1
-                logger.warning(
-                    "Skipping question _id=%s: failed to build reference answer",
-                    q_id,
-                )
-                pbar.update(1)
-                continue
-
-            picked = pick_three_responses_for_question(responses)
-            if len(picked) != 3:
-                skipped_not_enough_levels += 1
-                logger.info(
-                    "Skipping question _id=%s: could not pick 3 distinct responses with required score levels",
-                    q_id,
-                )
-                pbar.update(1)
-                continue
-
-            total_questions_used += 1
-
-            # لاگ نسبت‌های انتخاب‌شده برای ردیابی دقیق
-            ratios_selected = [float(r["ratio"]) for r in picked]
-            logger.debug(
-                "Question _id=%s | picked ratios=%s",
+        question_text, info, responses = select_responses_for_question(question)
+        if not question_text or not responses:
+            local_stats["skipped_no_valid_responses"] += 1
+            logger.info(
+                "Skipping question _id=%s: no valid responses after ratio filter",
                 q_id,
-                ratios_selected,
             )
+            return {"stats": local_stats, "records": []}
 
-            for r in picked:
-                ratio = float(r["ratio"])
-                student_answer = str(r["value"])
-                text = build_eval_prompt(
-                    question_text=question_text,
-                    true_answer=true_answer,
-                    student_answer=student_answer,
-                )
-                label = ratio_to_label(ratio)
+        # Use "correct" responses (طبق threshold دیتاست اصلی) to build reference answer.
+        correct_answers = [r["value"] for r in responses if r.get("is_correct")]
+        if not correct_answers:
+            local_stats["skipped_no_correct_for_ref"] += 1
+            logger.info(
+                "Skipping question _id=%s: no responses above correctness threshold (%.2f)",
+                q_id,
+                CORRECTNESS_THRESHOLD,
+            )
+            return {"stats": local_stats, "records": []}
 
-                record = {
-                    "text": text,
-                    "label": label,
-                    "ratio": ratio,
-                    "question_id": q_id,
-                }
-                jsonl_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+        true_answer = build_reference_answer(
+            client=client,
+            question_text=question_text,
+            info=info,
+            correct_answers=correct_answers[:10],
+        )
+        if not true_answer:
+            local_stats["skipped_model_failure"] += 1
+            logger.warning(
+                "Skipping question _id=%s: failed to build reference answer",
+                q_id,
+            )
+            return {"stats": local_stats, "records": []}
+
+        picked = pick_three_responses_for_question(responses)
+        if len(picked) != 3:
+            local_stats["skipped_not_enough_levels"] += 1
+            logger.info(
+                "Skipping question _id=%s: could not pick 3 distinct responses with required score levels",
+                q_id,
+            )
+            return {"stats": local_stats, "records": []}
+
+        local_stats["questions_used"] = 1
+
+        # لاگ نسبت‌های انتخاب‌شده برای ردیابی دقیق
+        ratios_selected = [float(r["ratio"]) for r in picked]
+        logger.debug(
+            "Question _id=%s | picked ratios=%s",
+            q_id,
+            ratios_selected,
+        )
+
+        records: List[Dict[str, Any]] = []
+        for r in picked:
+            ratio = float(r["ratio"])
+            student_answer = str(r["value"])
+            text = build_eval_prompt(
+                question_text=question_text,
+                true_answer=true_answer,
+                student_answer=student_answer,
+            )
+            label = ratio_to_label(ratio)
+
+            record = {
+                "text": text,
+                "label": label,
+                "ratio": ratio,
+                "question_id": q_id,
+            }
+            records.append(record)
+
+        local_stats["rows"] = len(records)
+        return {"stats": local_stats, "records": records}
+
+    with (
+        open(output_path, "w", encoding="utf-8") as jsonl_file,
+        ThreadPoolExecutor(max_workers=N_WORKERS) as executor,
+        tqdm(
+            total=len(questions),
+            desc="📦 Building final eval dataset",
+            unit="question",
+            bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+        ) as pbar,
+    ):
+        futures = [executor.submit(_process_one_question, q) for q in questions]
+        for fut in as_completed(futures):
+            result = fut.result()
+            stats = result["stats"]
+            records = result["records"]
+
+            total_questions_read += stats["questions_read"]
+            total_questions_used += stats["questions_used"]
+            skipped_no_valid_responses += stats["skipped_no_valid_responses"]
+            skipped_no_correct_for_ref += stats["skipped_no_correct_for_ref"]
+            skipped_model_failure += stats["skipped_model_failure"]
+            skipped_not_enough_levels += stats["skipped_not_enough_levels"]
+
+            for rec in records:
+                jsonl_file.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 total_rows += 1
 
             pbar.update(1)

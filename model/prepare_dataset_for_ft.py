@@ -7,15 +7,13 @@ from datasets import Dataset
 df = pd.read_csv("../qa_dataset.csv")  # مسیر فایل CSV خودت
 
 
-# 2. ستون text (prompt) بساز – شامل پاسخ هدف YES/NO برای Causal LM
+# 2. ستون text (prompt) بساز – فقط صورت سؤال و پاسخ‌ها، بدون چسباندن YES/NO
 def create_prompt(row):
-    target_answer = "YES" if row["is_correct"] else "NO"
     return (
         f"Question: {row['question_text']}\n"
         f"True response: {row['true_answer']}\n"
         f"Student answer: {row['student_answer']}\n"
-        f"Student's answer is correct with True response? YES/NO\n"
-        f"Model: {target_answer}"
+        "Student's answer is correct with True response? YES/NO"
     )
 
 

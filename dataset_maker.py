@@ -18,7 +18,7 @@ INPUT_FILE = "result.v2.jsonl"
 OUTPUT_FILE = "qa_dataset.csv"
 
 # Maximum number of answers per question to include in the dataset
-MAX_RESPONSES_PER_QUESTION = 50
+MAX_RESPONSES_PER_QUESTION = 40
 
 # Score ratio threshold for considering an answer "correct"
 # ratio = score / base_score
@@ -27,7 +27,7 @@ MIN_INCORRECT_FRACTION = 0.1  # at least 10% incorrect per question (if availabl
 MAX_INCORRECT_FRACTION = 0.3  # at most 30% incorrect per question
 
 # Maximum number of questions to process
-MAX_QUESTIONS = 400
+MAX_QUESTIONS = 1000
 
 # Local llama.cpp (OpenAI-compatible) configuration
 LLAMA_BASE_URL = "http://127.0.0.1:5836/v1"
@@ -262,13 +262,13 @@ Return your result as JSON with this exact schema:
   "reference_answer": "string, the ideal Persian reference answer"
 }}
 
-Question (Persian):
+Question:
 {question_text}
 
 Question metadata (may be empty, JSON):
 {info_json}
 
-High-scoring student answers (Persian):
+High-scoring student answers:
 {answers_block}
 """.strip()
 
@@ -397,7 +397,7 @@ def build_dataset(
     Main entry point.
 
     Reads questions line-by-line from input_path (JSONL),
-    calls Google GenAI once per question to construct a reference answer,
+    calls LLaMA.cpp once per question to construct a reference answer,
     and writes rows to a CSV file with columns:
         question_text, true_answer, student_answer, is_correct, correction_ratio
 
@@ -463,7 +463,7 @@ def build_dataset(
 
                 # Only use responses that pass the correctness threshold to build the reference answer
                 correct_answers = [r["value"] for r in responses if r["is_correct"]][
-                    :20
+                    :12
                 ]
                 if not correct_answers:
                     skipped_no_correct_for_ref += 1
